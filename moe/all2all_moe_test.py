@@ -10,7 +10,8 @@ import os
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from all2all_moe import DeepseekV3MoE, Config
+from all2all_moe import DeepseekV3MoE
+from config import Config
 from utils import setup_logging
 
 

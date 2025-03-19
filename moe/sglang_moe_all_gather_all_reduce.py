@@ -13,7 +13,8 @@ from group_gemm_kernel import (
 )
 
 from utils import ResultCollector
-from all2all_moe import MoEGate, Config
+from all2all_moe import MoEGate
+from config import Config
 
 
 class GroupedGemmRunner(torch.nn.Module):
