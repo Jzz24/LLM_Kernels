@@ -159,22 +159,26 @@ class ResultAnalyzer:
             
         if var_name:
             logger.info(f"Rank {rank}: Analyzing variable {var_name}")
+
+        # Reshape for token-level cosine similarity
+        reshaped_all_gather = tensor1.reshape(-1, tensor1.shape[-1])
+        reshaped_all_to_all = tensor2.reshape(-1, tensor2.shape[-1])
             
         # Calculate absolute difference between outputs
-        abs_diff = torch.abs(tensor1 - tensor2)
+        abs_diff = torch.abs(reshaped_all_gather - reshaped_all_to_all)
         max_diff = abs_diff.max().item()
         mean_diff = abs_diff.mean().item()
         
         # Calculate relative difference
-        max_abs_values = torch.maximum(torch.abs(tensor1), torch.abs(tensor2))
+        max_abs_values = torch.maximum(torch.abs(reshaped_all_gather), torch.abs(reshaped_all_to_all))
         eps = EPSILON
         rel_diff = abs_diff / (max_abs_values + eps)
         max_rel_diff = rel_diff.max().item()
         mean_rel_diff = rel_diff.mean().item()
         
-        # Reshape for token-level cosine similarity
-        reshaped_all_gather = tensor1.reshape(-1, tensor1.shape[-1])
-        reshaped_all_to_all = tensor2.reshape(-1, tensor2.shape[-1])
+        # # Reshape for token-level cosine similarity
+        # reshaped_all_gather = tensor1.reshape(-1, tensor1.shape[-1])
+        # reshaped_all_to_all = tensor2.reshape(-1, tensor2.shape[-1])
         
         # Calculate cosine similarity for each token vector
         token_cos_sim = torch.nn.functional.cosine_similarity(reshaped_all_gather, reshaped_all_to_all, dim=1)

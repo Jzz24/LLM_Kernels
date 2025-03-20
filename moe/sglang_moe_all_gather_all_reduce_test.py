@@ -7,11 +7,15 @@ Tests the functionality of the EPMoE implementation with the All-Gather + All-Re
 """
 
 import os
+import sys
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from sglang_moe_all_gather_all_reduce import EPMoE
 from utils import setup_logging
+from config import Config
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 def setup_distributed(rank, world_size):
@@ -22,42 +26,74 @@ def setup_distributed(rank, world_size):
     torch.cuda.set_device(rank)
 
 
+def initialize_quantized_weights(model, seed=42, std=0.1, block_size=128):
+    with torch.no_grad():
+        torch.manual_seed(seed)
+        
+        torch.nn.init.normal_(model.gate.weight, mean=0.0, std=0.1)
+        
+        w13_fp16 = torch.empty(
+            model.num_experts_per_partition,
+            2 * model.intermediate_size,
+            model.hidden_size,
+            device=model.w13_weight.device,
+            dtype=torch.float16
+        )
+
+        torch.nn.init.normal_(w13_fp16, mean=0.0, std=std)
+        
+        w2_fp16 = torch.empty(
+            model.num_experts_per_partition,
+            model.hidden_size,
+            model.intermediate_size,
+            device=model.w2_weight.device,
+            dtype=torch.float16
+        )
+
+        torch.nn.init.normal_(w2_fp16, mean=0.0, std=std)
+        
+
+        from quantization.int8_kernel import weight_quant
+        for expert_idx in range(model.num_experts_per_partition):
+            # 量化 w13_weight
+            w13_quant, w13_scale = weight_quant(w13_fp16[expert_idx], block_size=block_size)
+            model.w13_weight[expert_idx].copy_(w13_quant)
+            model.w13_weight_scale[expert_idx].copy_(w13_scale)
+            
+            # 量化 w2_weight
+            w2_quant, w2_scale = weight_quant(w2_fp16[expert_idx], block_size=block_size)
+            model.w2_weight[expert_idx].copy_(w2_quant)
+            model.w2_weight_scale[expert_idx].copy_(w2_scale)
+    
+    return model
+
 def run_on_gpu(rank, world_size):
     """Run EPMoE model on a single GPU."""
     setup_distributed(rank, world_size)
     logger = setup_logging(f"epmoe_test_rank{rank}")
-    
     torch.set_default_dtype(torch.float16)
-    num_experts = 256  # 必须能被world_size整除
-    top_k = 8
-    hidden_size = 7168
-    intermediate_size = 2048
+
     batch_size = 2
-    seq_len = 256
+    seq_len = 512
     seed = 42
 
-    # 创建模型
-    model = EPMoE(
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        tp_size=world_size,
-        activation="silu",
-        renormalize=True
-    ).eval().cuda()
-    
+    config = Config()
+    config.ep_size = world_size
+    model = EPMoE(config).eval().cuda()
     logger.info(f"Model creation completed")
     
     # 初始化权重
     with torch.no_grad():
         torch.manual_seed(seed)
         torch.nn.init.normal_(model.gate.weight, mean=0.0, std=0.1)
-        torch.nn.init.normal_(model.w13_weight, mean=0.0, std=0.01)
-        torch.nn.init.normal_(model.w2_weight, mean=0.0, std=0.01)
-    
+        if not config.quantize_method:
+            torch.nn.init.normal_(model.w13_weight, mean=0.0, std=0.01)
+            torch.nn.init.normal_(model.w2_weight, mean=0.0, std=0.01)
+        else:
+            model = initialize_quantized_weights(model)
+
     input_data = torch.randn(
-        batch_size, seq_len, hidden_size, 
+        batch_size, seq_len, config.hidden_size, 
         device=f"cuda:{rank}", 
         dtype=torch.float16
     )
@@ -73,7 +109,7 @@ def run_on_gpu(rank, world_size):
     with torch.no_grad():
         output = model(input_data)
     
-    output_sum = output.sum().item()
+    output_sum = output.float().sum().item()
     logger.info(f"GPU {rank} Output sum: {output_sum:.4f}")
     
     dist.destroy_process_group()

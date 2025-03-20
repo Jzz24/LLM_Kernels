@@ -276,6 +276,7 @@ class DeepseekV3MoE(nn.Module):
             .sum(dim=1)
             .type(new_x.dtype)
         )
+        ResultCollector.save("output", final_out, prefix="all2all")
         return final_out
 
     @torch.no_grad()

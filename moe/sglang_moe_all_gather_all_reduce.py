@@ -16,6 +16,8 @@ from utils import ResultCollector
 from all2all_moe import MoEGate
 from config import Config
 
+PREFIX = "epmoe"
+
 
 class GroupedGemmRunner(torch.nn.Module):
     """简化的GroupedGemmRunner"""
@@ -51,24 +53,15 @@ class EPMoE(torch.nn.Module):
 
     def __init__(
         self,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        params_dtype: Optional[torch.dtype] = None,
-        renormalize: bool = True,
-        use_grouped_topk: bool = True,
-        num_expert_group: Optional[int] = 8,
-        topk_group: Optional[int] = 4,
-        tp_size: Optional[int] = None,
-        activation: str = "silu",
+        config: Config,
     ):
         super().__init__()
 
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
+        self.config = config
+        # if params_dtype is None:
+        #     params_dtype = torch.get_default_dtype()
 
-        self.tp_size = tp_size or 1
+        self.tp_size = self.config.ep_size or 1
         if self.tp_size > 1:
             # 初始化分布式环境
             if not dist.is_initialized():
@@ -77,66 +70,94 @@ class EPMoE(torch.nn.Module):
         else:
             self.tp_rank = 0
 
-        self.num_experts = num_experts
+        self.num_experts = self.config.n_routed_experts
         assert self.num_experts % self.tp_size == 0, "专家数量必须被GPU数量整除"
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
-        self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.renormalize = renormalize
-        self.use_grouped_topk = use_grouped_topk
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.activation = activation
+        self.top_k = self.config.num_experts_per_tok
+        self.hidden_size = self.config.hidden_size
+        self.intermediate_size = self.config.moe_intermediate_size
+        self.renormalize = True
+        self.use_grouped_topk = True
+        self.num_expert_group = self.config.n_group
+        self.topk_group = self.config.topk_group
+        self.activation = self.config.hidden_act
 
-        # 简化的量化设置
-        self.use_fp8_w8a8 = False
-        self.use_block_quant = False
-        self.block_shape = None
-
-        # 初始化权重
-        # w13_weight: 融合的gate和up投影
-        self.w13_weight = nn.Parameter(
-            torch.empty(
-                self.num_experts_per_partition,
-                2 * intermediate_size,
-                hidden_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        
-        # w2_weight: down投影
-        self.w2_weight = nn.Parameter(
-            torch.empty(
-                self.num_experts_per_partition,
-                hidden_size,
-                intermediate_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        
-        # 初始化缩放因子
-        ones_tensor = torch.ones(self.num_experts_per_partition, dtype=torch.float32)
-        self.w13_input_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
-        self.w2_input_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
-        self.w13_weight_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
-        self.w2_weight_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
-        
         # 为方便对比，使用MoEGate
         # self.router = nn.Linear(hidden_size, num_experts, bias=False)
-        self.config = Config()
+        # self.config = Config()
         self.gate = MoEGate(self.config)
-        
         # 初始化GroupedGemmRunner
         self.grouped_gemm_runner = None
+        self._init_weight_and_scale()
+
+    def _init_weight_and_scale(self,):
+        params_dtype = self.config.w_dtype if self.config.quantize_method else torch.get_default_dtype()
+
+        self.w13_weight = nn.Parameter(
+            torch.ones(
+                self.num_experts_per_partition,
+                2 * self.intermediate_size,
+                self.hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+
+        self.w2_weight = nn.Parameter(
+            torch.ones(
+                self.num_experts_per_partition,
+                self.hidden_size,
+                self.intermediate_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+
+        ones_tensor = torch.ones(self.num_experts_per_partition, dtype=torch.float16)
+        self.w13_input_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
+        self.w2_input_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
+
+        # 在group_gemm内部初始化
+        self.w13_input_scale = None
+        self.w2_input_scale = None
+
+        if self.config.use_block_quant and self.config.quantize_method is not None:
+            block_n, block_k = self.config.w_quant_block_size
+            self.w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    self.num_experts_per_partition,
+                    2 * ((self.intermediate_size + block_n - 1) // block_n),
+                    (self.hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            self.w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    self.num_experts_per_partition,
+                    (self.hidden_size + block_n - 1) // block_n,
+                    (self.intermediate_size + block_k - 1) // block_k,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+        else:
+            self.w13_weight_scale = None
+            self.w2_weight_scale = None
+
+        #######
+        # 简化的量化设置
+        self.use_fp8_w8a8 = False
+        self.use_block_quant = self.config.use_block_quant
+        self.block_shape = self.config.w_quant_block_size if self.config.quantize_method \
+                                                        and self.use_block_quant else None
+
 
     def forward(self, hidden_states: torch.Tensor, router_logits: Optional[torch.Tensor] = None):
-        ResultCollector.save("hidden_states", hidden_states, prefix="epmoe", rank=self.tp_rank)
+        ResultCollector.save("hidden_states", hidden_states, prefix=PREFIX, rank=self.tp_rank)
         # 初始化GroupedGemmRunner(如果需要)
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(hidden_states.device)
@@ -149,8 +170,8 @@ class EPMoE(torch.nn.Module):
         # 计算路由概率和topk专家, 使用deepseekv3 hf版本的实现
         topk_ids, topk_weights = self.gate(hidden_states)
 
-        ResultCollector.save("topk_weights", topk_weights, prefix="epmoe", rank=self.tp_rank)
-        ResultCollector.save("topk_ids", topk_ids.float(), prefix="epmoe", rank=self.tp_rank)
+        ResultCollector.save("topk_weights", topk_weights, prefix=PREFIX, rank=self.tp_rank)
+        ResultCollector.save("topk_ids", topk_ids.float(), prefix=PREFIX, rank=self.tp_rank)
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         topk_ids = topk_ids.reshape(-1, self.top_k)
@@ -163,17 +184,19 @@ class EPMoE(torch.nn.Module):
         )
         
         # 准备gateup_input
+        # TODO: 将hidden_states量化和reorder组合在一个kernel里面，
+        # sglang默认采用的是expert的量化，不符合我们的需求，但为保持接口一致，暂时不修改
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        # TODO: dynamic quantize hidden_states, to init self.w13_input_scale
         
         # 按照expert顺序重排每个rank的tokens
+        # 输入fp16 hidden_states, 输出量化的gateup_input
         # 申请[num_tokens * topk, hidden_size]形状的gateup_input
         # 在当前非all_to_all的通信模式下
-        # 重排后的gateup_input,每个rank只处理 约1/num_rank 的专家
+        # 重排后的gateup_input,每个rank只处理 约1/num_rank 的tokens
         # 因此大约有(num_rank-1)/num_rank的空间被浪费
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
@@ -205,6 +228,8 @@ class EPMoE(torch.nn.Module):
             dtype=hidden_states.dtype,
         )
 
+        # TODO: 接收已经量化的gateup_in
+        # 当前gateup_in的量化在group_gemm_kernel中完成,待优化
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input, # [num_tokens * topk, hidden_size]
             b=self.w13_weight, # [num_experts_per_partition, 2 * intermediate_size, hidden_size]
@@ -218,8 +243,12 @@ class EPMoE(torch.nn.Module):
             scale_b=self.w13_weight_scale,
             block_shape=self.block_shape,
         )
+
+        assert gateup_output.isnan().sum() == 0, "gateup_output has NaN"
+        assert gateup_output.isinf().sum() == 0, "gateup_output has Inf"
         
         # 准备down_input
+        # TODO:将down_input的量化和激活函数组合在一个kernel里面
         down_input = torch.empty(
             gateup_output.shape[0], # num_tokens * topk
             gateup_output.shape[1] // 2, # intermediate_size
@@ -261,6 +290,8 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+        # TODO：接收已经量化的down_input
+        # 当前down_input的量化在group_gemm_kernel中完成,待优化
         down_output = self.grouped_gemm_runner(
             a=down_input,
             b=self.w2_weight,
@@ -274,7 +305,7 @@ class EPMoE(torch.nn.Module):
             scale_b=self.w2_weight_scale,
             block_shape=self.block_shape,
         )
-        
+
         # 后重排序输出
         output = torch.empty(
             (batch_size, seq_len, self.hidden_size),
@@ -293,6 +324,9 @@ class EPMoE(torch.nn.Module):
             self.hidden_size,
             BLOCK_SIZE=512,
         )
+
         if self.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
+
+        ResultCollector.save("output", output, prefix=PREFIX, rank=self.tp_rank)
         return output

@@ -99,15 +99,7 @@ def create_models(config: Config, world_size: int) -> Tuple[AllToAllMoE, EPMoE]:
     """
     model_all_to_all = AllToAllMoE(config).eval().cuda()
     
-    model_all_gather = EPMoE(
-        num_experts=config.n_routed_experts,
-        top_k=config.num_experts_per_tok,
-        hidden_size=config.hidden_size,
-        intermediate_size=config.moe_intermediate_size,
-        tp_size=world_size,
-        activation="silu",
-        renormalize=True
-    ).eval().cuda()
+    model_all_gather = EPMoE(config).eval().cuda()
     
     return model_all_to_all, model_all_gather
 
