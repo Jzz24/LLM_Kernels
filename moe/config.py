@@ -20,10 +20,11 @@ class Config:
         self.use_triton_group_gemm = False
 
         # quantization
-        self.quantize_method = None #"blockwise_w8a8_int8_gemm" # None for no quantization
-        self.use_block_quant = False
-        self.w_quant_block_size = None #(128, 128)
-        self.a_quant_block_size = None #(1, 128)
+        self.quantize_method = None
+        # self.quantize_method = "blockwise_w8a8_int8_gemm" # None for no quantization
+        self.use_block_quant = True
+        self.w_quant_block_size = (128, 128)
+        self.a_quant_block_size = (1, 128)
         self.w_bit = 8
         self.a_bit = 8
         self.w_dtype = torch.int8

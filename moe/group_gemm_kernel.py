@@ -371,25 +371,33 @@ def grouped_gemm_triton_kernel(
     offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptr = a + (m_range_start + offs_am[:, None]) * a_stride_0 + offs_k[None, :]
+    a_ptr = a + (m_range_start + offs_am[:, None]) * a_stride_0 + offs_k[None, :] # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
+    # b_ptr = b + (
+    #     (expert_id * b_stride_0)
+    #     + (n_range_start + offs_bn[:, None]) * b_stride_1
+    #     + offs_k[None, :]
+    # ) # shape (BLOCK_SIZE_N, BLOCK_SIZE_K)
     b_ptr = b + (
         (expert_id * b_stride_0)
-        + (n_range_start + offs_bn[:, None]) * b_stride_1
-        + offs_k[None, :]
+        + (n_range_start + offs_bn[None, :]) * b_stride_1
+        + offs_k[:, None]
     )
 
     if group_k > 0 and group_n > 0:
-        a_scale_ptrs = scale_a + (m_range_start + offs_am[:, None]) * as_stride_0
+        a_scale_ptrs = scale_a + (m_range_start + offs_am[:, None]) * as_stride_0 # shape (BLOCK_SIZE_M, 1)
         offs_bsn = (n_range_start + offs_bn) // group_n
-        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + offs_bsn * bs_stride_1
+        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + offs_bsn * bs_stride_1 # shape (BLOCK_SIZE_N,)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_tile = tl.load(
             a_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
         )
+        # b_tile = tl.load(
+        #     b_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
+        # )
         b_tile = tl.load(
-            b_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
+            b_ptr, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0
         )
 
         if group_k > 0 and group_n > 0:
@@ -397,9 +405,12 @@ def grouped_gemm_triton_kernel(
             offs_ks = k_start // group_k
             a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1).to(tl.float32)
             b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2).to(tl.float32)
-            accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
+            # accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
+            accumulator += tl.dot(a_tile, b_tile) * a_scale * b_scale[None, :]
+            
         else:
-            accumulator = tl.dot(a_tile, b_tile.T, accumulator)
+            # accumulator = tl.dot(a_tile, b_tile.T, accumulator)
+            accumulator = tl.dot(a_tile, b_tile, accumulator)
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 

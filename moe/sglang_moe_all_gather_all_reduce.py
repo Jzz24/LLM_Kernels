@@ -16,7 +16,7 @@ from utils import ResultCollector
 from all2all_moe import MoEGate
 from config import Config
 
-PREFIX = "epmoe"
+PREFIX = "all2all"
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -230,6 +230,7 @@ class EPMoE(torch.nn.Module):
 
         # TODO: 接收已经量化的gateup_in
         # 当前gateup_in的量化在group_gemm_kernel中完成,待优化
+        ResultCollector.save("gateup_input", gateup_input, prefix=PREFIX, rank=self.tp_rank)
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input, # [num_tokens * topk, hidden_size]
             b=self.w13_weight, # [num_experts_per_partition, 2 * intermediate_size, hidden_size]
@@ -243,6 +244,8 @@ class EPMoE(torch.nn.Module):
             scale_b=self.w13_weight_scale,
             block_shape=self.block_shape,
         )
+
+        ResultCollector.save("gateup_output", gateup_output, prefix=PREFIX, rank=self.tp_rank)
 
         assert gateup_output.isnan().sum() == 0, "gateup_output has NaN"
         assert gateup_output.isinf().sum() == 0, "gateup_output has Inf"

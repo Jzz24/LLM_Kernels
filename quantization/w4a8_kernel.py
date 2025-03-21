@@ -389,7 +389,6 @@ def test_w4a8_gemm():
 def test_weight_quant_dequant():
     # Create a random FP16 tensor
     x = torch.randn(256, 7168, dtype=torch.float16, device='cuda').contiguous()
-    # x = torch.load('test.pt').contiguous()
     
     # Quantize the tensor
     y_quant, s, s4, z4 = weight_quant(x)
@@ -403,5 +402,6 @@ def test_weight_quant_dequant():
     print(f'Cosine similarity between original and dequantized tensor: {cos_sim.item()}')
 
 if __name__ == "__main__":
+    torch.set_default_dtype(torch.float16)
     test_weight_quant_dequant()
     test_w4a8_gemm()

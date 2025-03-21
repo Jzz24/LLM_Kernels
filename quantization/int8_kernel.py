@@ -296,5 +296,6 @@ def test_int8_gemm():
 
 
 if __name__ == "__main__":
+    torch.set_default_dtype(torch.float16)
     test_weight_quant_dequant()
     test_int8_gemm()
