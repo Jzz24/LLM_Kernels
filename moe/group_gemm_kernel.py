@@ -456,7 +456,7 @@ def grouped_gemm_triton(
     if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
-    if block_shape is not None:
+    if block_shape is not None and b.dtype != torch.float16:
         # quantize activations
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]

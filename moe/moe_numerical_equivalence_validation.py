@@ -58,6 +58,13 @@ def synchronize_weights(source_model: AllToAllMoE, target_model: EPMoE) -> None:
         target_model.gate.weight.data.copy_(source_model.gate.weight.data)
         if hasattr(source_model.gate, "bias") and source_model.gate.bias is not None:
             target_model.gate.bias.data.copy_(source_model.gate.bias.data)
+
+        is_quantized = (hasattr(target_model, 'config') and 
+                target_model.config.quantize_method is not None and 
+                target_model.config.use_block_quant)
+        if is_quantized:
+            from quantization.int8_kernel import weight_quant
+            block_size = target_model.config.w_quant_block_size[0]
         
         # Copy expert weights - respecting the distributed expert partitioning
         for i, expert in enumerate(source_model.experts):
@@ -68,19 +75,38 @@ def synchronize_weights(source_model: AllToAllMoE, target_model: EPMoE) -> None:
                 
                 # Calculate local expert index within this partition
                 local_i = i - target_model.start_expert_id
-                
-                # Copy gate_proj (W1) to the first half of w13_weight
-                target_model.w13_weight.data[local_i, :target_model.intermediate_size, :] = (
-                    expert.gate_proj.weight.data
-                )
-                
-                # Copy up_proj (W3) to the second half of w13_weight
-                target_model.w13_weight.data[local_i, target_model.intermediate_size:, :] = (
-                    expert.up_proj.weight.data
-                )
-                
-                # Copy down_proj (W2)
-                target_model.w2_weight.data[local_i] = expert.down_proj.weight.data
+
+                if is_quantized:
+                    w13_fp16 = torch.empty(
+                        2 * target_model.intermediate_size,
+                        target_model.hidden_size,
+                        device=target_model.w13_weight.device,
+                        dtype=torch.float16
+                    )
+                    
+                    w13_fp16[:target_model.intermediate_size, :] = expert.gate_proj.weight.data
+                    w13_fp16[target_model.intermediate_size:, :] = expert.up_proj.weight.data
+                    
+                    w13_quant, w13_scale = weight_quant(w13_fp16, block_size=block_size)
+                    target_model.w13_weight[local_i] = w13_quant
+                    target_model.w13_weight_scale[local_i] = w13_scale
+                    
+                    w2_quant, w2_scale = weight_quant(expert.down_proj.weight.data, block_size=block_size)
+                    target_model.w2_weight[local_i] = w2_quant
+                    target_model.w2_weight_scale[local_i] = w2_scale
+                else:
+                    # Copy gate_proj (W1) to the first half of w13_weight
+                    target_model.w13_weight.data[local_i, :target_model.intermediate_size, :] = (
+                        expert.gate_proj.weight.data
+                    )
+                    
+                    # Copy up_proj (W3) to the second half of w13_weight
+                    target_model.w13_weight.data[local_i, target_model.intermediate_size:, :] = (
+                        expert.up_proj.weight.data
+                    )
+                    
+                    # Copy down_proj (W2)
+                    target_model.w2_weight.data[local_i] = expert.down_proj.weight.data
                 
         logger = logging.getLogger("moe_validation")
         logger.info(f"Model weights synchronized successfully")

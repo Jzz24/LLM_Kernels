@@ -26,12 +26,11 @@ def setup_distributed(rank, world_size):
     torch.cuda.set_device(rank)
 
 
-def initialize_quantized_weights(model, seed=42, std=0.1, block_size=128):
+def initialize_quantized_weights(model, seed=42, std=0.01, block_size=128, quantize=False):
     with torch.no_grad():
         torch.manual_seed(seed)
-        
         torch.nn.init.normal_(model.gate.weight, mean=0.0, std=0.1)
-        
+
         w13_fp16 = torch.empty(
             model.num_experts_per_partition,
             2 * model.intermediate_size,
@@ -49,29 +48,31 @@ def initialize_quantized_weights(model, seed=42, std=0.1, block_size=128):
             device=model.w2_weight.device,
             dtype=torch.float16
         )
-
         torch.nn.init.normal_(w2_fp16, mean=0.0, std=std)
         
 
-        from quantization.int8_kernel import weight_quant
-        for expert_idx in range(model.num_experts_per_partition):
-            # 量化 w13_weight
-            w13_quant, w13_scale = weight_quant(w13_fp16[expert_idx], block_size=block_size)
-            model.w13_weight[expert_idx].copy_(w13_quant)
-            model.w13_weight_scale[expert_idx].copy_(w13_scale)
-            
-            # 量化 w2_weight
-            w2_quant, w2_scale = weight_quant(w2_fp16[expert_idx], block_size=block_size)
-            model.w2_weight[expert_idx].copy_(w2_quant)
-            model.w2_weight_scale[expert_idx].copy_(w2_scale)
-    
+        if not quantize:
+            model.w13_weight.data.copy_(w13_fp16)
+            model.w2_weight.data.copy_(w2_fp16)
+        else:
+            from quantization.int8_kernel import weight_quant
+            for expert_idx in range(model.num_experts_per_partition):
+                # 量化 w13_weight
+                w13_quant, w13_scale = weight_quant(w13_fp16[expert_idx], block_size=block_size)
+                model.w13_weight[expert_idx] = w13_quant
+                model.w13_weight_scale[expert_idx] = w13_scale
+                
+                # 量化 w2_weight
+                w2_quant, w2_scale = weight_quant(w2_fp16[expert_idx], block_size=block_size)
+                model.w2_weight[expert_idx] = w2_quant
+                model.w2_weight_scale[expert_idx] = w2_scale
     return model
 
 def run_on_gpu(rank, world_size):
     """Run EPMoE model on a single GPU."""
     setup_distributed(rank, world_size)
-    logger = setup_logging(f"epmoe_test_rank{rank}")
     torch.set_default_dtype(torch.float16)
+    logger = setup_logging(f"epmoe_test_rank{rank}")
 
     batch_size = 2
     seq_len = 512
@@ -81,16 +82,9 @@ def run_on_gpu(rank, world_size):
     config.ep_size = world_size
     model = EPMoE(config).eval().cuda()
     logger.info(f"Model creation completed")
-    
-    # 初始化权重
-    with torch.no_grad():
-        torch.manual_seed(seed)
-        torch.nn.init.normal_(model.gate.weight, mean=0.0, std=0.1)
-        if not config.quantize_method:
-            torch.nn.init.normal_(model.w13_weight, mean=0.0, std=0.01)
-            torch.nn.init.normal_(model.w2_weight, mean=0.0, std=0.01)
-        else:
-            model = initialize_quantized_weights(model)
+
+    quantize_flag = config.quantize_method is not None and config.use_block_quant
+    model = initialize_quantized_weights(model, seed=seed, std=0.01, block_size=128, quantize=quantize_flag)
 
     input_data = torch.randn(
         batch_size, seq_len, config.hidden_size, 

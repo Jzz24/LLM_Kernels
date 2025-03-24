@@ -1,3 +1,6 @@
+import os
+import sys
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -16,8 +19,8 @@ from utils import ResultCollector
 from all2all_moe import MoEGate
 from config import Config
 
-PREFIX = "all2all"
-
+PREFIX = "epmoe"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 class GroupedGemmRunner(torch.nn.Module):
     """简化的GroupedGemmRunner"""
@@ -45,7 +48,116 @@ class GroupedGemmRunner(torch.nn.Module):
             seg_indptr, weight_indices, use_fp8_w8a8,
             scale_a, scale_b, block_shape=block_shape
         )
+        # c = grouped_gemm_pytorch(
+        #     a, b, c, batch_size, seg_indptr, weight_indices, use_fp8_w8a8,
+        #     scale_a, scale_b, block_shape
+        # )
         return c
+
+
+def grouped_gemm_pytorch(
+    a: torch.Tensor,                     # 输入激活，形状(M, K)
+    b: torch.Tensor,                     # 权重，形状(num_experts, N, K)
+    c: torch.Tensor,                     # 输出结果，形状(M, N)
+    batch_size: int,                     # 专家数量
+    seg_indptr: torch.Tensor,            # 每个专家对应的token起止位置
+    weight_indices: torch.Tensor,        # 专家ID映射
+    use_fp8_w8a8: bool = False,
+    scale_a: torch.Tensor = None,        # 激活量化尺度
+    scale_b: torch.Tensor = None,        # 权重量化尺度
+    block_shape: tuple = None            # 量化块大小
+):
+    """
+    PyTorch版本的grouped_gemm实现，与Triton实现保持一致的计算逻辑
+    """
+    
+    # 获取尺寸信息
+    M = a.size(0)
+    N = b.size(1)
+    K = b.size(2)
+    device = a.device
+    dtype = torch.float16  # 最终结果使用float16
+    
+    if block_shape is not None:
+        from quantization.int8_kernel import act_quant
+        a, scale_a = act_quant(a)
+        # import ipdb; ipdb.set_trace()
+
+    for expert_idx in range(batch_size):
+        # 获取当前专家对应的token范围
+        m_start = seg_indptr[expert_idx].item()
+        m_end = seg_indptr[expert_idx + 1].item()
+        
+        # 如果没有token，跳过
+        if m_end <= m_start:
+            continue
+        
+        # 获取实际的expert_id
+        expert_id = weight_indices[expert_idx].item()
+        
+        # 选择对应的激活和权重
+        current_a = a[m_start:m_end]  # shape: (token_count, K)
+        current_b = b[expert_id]      # shape: (N, K)
+
+
+        # 如果使用块量化
+        if block_shape is not None:
+
+            block_n, block_k = block_shape
+            n_blocks = (N + block_n - 1) // block_n
+            k_blocks = (K + block_k - 1) // block_k
+
+            for n_idx in range(n_blocks):
+                n_start = n_idx * block_n
+                n_end = min(n_start + block_n, N)
+                
+                # 为当前n块创建结果缓冲区
+                result_block = torch.zeros((m_end - m_start, n_end - n_start), 
+                                          device=device, dtype=torch.float32)
+                
+                # 在K维度上累积
+                for k_idx in range(k_blocks):
+                    k_start = k_idx * block_k
+                    k_end = min(k_start + block_k, K)
+                    
+                    # 提取当前计算块
+                    a_block = current_a[:, k_start:k_end]
+                    b_block = current_b[n_start:n_end, k_start:k_end]
+
+                    if scale_a is not None:
+                        assert scale_a.ndim == 2, "scale_a must be 2D tensor"
+                        if scale_a.ndim == 2:
+                            # 按token和k块获取激活尺度
+                            a_block_scale = scale_a[m_start:m_end, k_idx].view(-1, 1)
+                    else:
+                        a_block_scale = 1.0
+                        
+                    if scale_b is not None:
+                        assert scale_b.ndim == 3, "scale_b must be 3D tensor"
+                        if scale_b.ndim == 3:
+                            # 按专家、n块和k块获取权重尺度
+                            b_block_scale = scale_b[expert_id, n_idx, k_idx]
+                    else:
+                        b_block_scale = 1.0
+                    
+                    # 计算当前块的矩阵乘法
+                    # 注意：b需要转置
+                    # block_result = torch.matmul(a_block, b_block.t()) * a_scale.float() * b_scale.float()
+                    block_result = torch.matmul(a_block*a_block_scale, b_block.t()*b_block_scale)
+
+                    # print (n_idx, k_idx, block_result.max(), block_result.min())
+                    if block_result.isnan().sum() != 0 or block_result.isinf().sum() != 0:
+                        import ipdb; ipdb.set_trace()
+                    result_block += block_result
+                c[m_start:m_end, n_start:n_end] = result_block.to(dtype)
+        else:
+            # 非量化模式，直接计算
+            c[m_start:m_end,] = torch.matmul(
+                current_a, current_b.t()
+            ) # shape (token_count, N)
+    
+    return c
+
 
 
 class EPMoE(torch.nn.Module):
@@ -115,10 +227,6 @@ class EPMoE(torch.nn.Module):
             ),
             requires_grad=False,
         )
-
-        ones_tensor = torch.ones(self.num_experts_per_partition, dtype=torch.float16)
-        self.w13_input_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
-        self.w2_input_scale = nn.Parameter(ones_tensor.clone(), requires_grad=False)
 
         # 在group_gemm内部初始化
         self.w13_input_scale = None
