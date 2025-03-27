@@ -39,7 +39,8 @@ def weight_dequant_int8_kernel(y_ptr, x_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constex
 @triton.jit
 def weight_dequant_int4_kernel(y_ptr, x_ptr, s4_ptr, z4_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     """
-    Dequantizes the int4 tensor `y` to float32 using block-wise dequantization.
+    Dequantizes the int4 tensor `y` to float32 using per-row (1×128) dequantization.
+    Each row of 128 elements uses its own scale and zero point.
 
     Args:
         y_ptr: Pointer to the input int4 tensor.
@@ -49,34 +50,54 @@ def weight_dequant_int4_kernel(y_ptr, x_ptr, s4_ptr, z4_ptr, M, N, BLOCK_SIZE: t
         M: Number of rows in the input tensor.
         N: Number of columns in the input tensor.
         BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
-
-    Returns:
-        None
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     n = tl.cdiv(N, BLOCK_SIZE)
+    
+    # Calculate offsets for this block
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # Linear offsets
     offs = (offs_m[:, None] * N + offs_n[None, :])
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    # Load quantized values
     y = tl.load(y_ptr + offs, mask=mask, other=0).to(tl.int8)
-    s4 = tl.load(s4_ptr + pid_m * n + pid_n).to(tl.int8)
-    z4 = tl.load(z4_ptr + pid_m * n + pid_n).to(tl.int8)
-    x = (y - z4) * s4
+    
+    # For each row in this block, load its scale and zero point
+    # Each row has its own s4 and z4 for every 128 columns
+    row_offsets = offs_m
+    col_idx = pid_n  # Column index for this block's scale/zero
+    
+    # Load scales and zero points with proper broadcasting
+    s4 = tl.load(s4_ptr + row_offsets * n + col_idx, mask=row_offsets < M, other=1).to(tl.int8)
+    z4 = tl.load(z4_ptr + row_offsets * n + col_idx, mask=row_offsets < M, other=0).to(tl.int8)
+    
+    # Reshape for broadcasting
+    s4_broadcast = s4[:, None]  # Shape: [BLOCK_SIZE, 1]
+    z4_broadcast = z4[:, None]  # Shape: [BLOCK_SIZE, 1]
+    
+    # Dequantize
+    x = (y - z4_broadcast) * s4_broadcast
+    
+    # Store results
     tl.store(x_ptr + offs, x, mask=mask)
 
-def weight_dequant(y: torch.Tensor, s: torch.Tensor, s4: torch.Tensor, z4: torch.Tensor, block_size: int = 128, block_size_int4: int = 16) -> torch.Tensor:
+def weight_dequant(y: torch.Tensor, s: torch.Tensor, s4: torch.Tensor, z4: torch.Tensor, 
+                  block_size: int = 128, group_size_int4: int = 128) -> torch.Tensor:
     """
     Dequantizes the input tensor `y` from int4 to float32 using block-wise dequantization.
+    The int4 quantization has a granularity of 1×128 (one scale+zero point per row per 128 columns).
 
     Args:
         y (torch.Tensor): The input quantized tensor.
         s (torch.Tensor): The scaling factors for int8.
-        s4 (torch.Tensor): The scaling factors for int4.
-        z4 (torch.Tensor): The zero points for int4.
-        block_size (int, optional): The size of the blocks to be used for dequantization. Default is 128.
-        block_size_int4 (int, optional): The size of the blocks for int4 dequantization. Default is 16.
+        s4 (torch.Tensor): The scaling factors for int4, shape [M, N/group_size_int4].
+        z4 (torch.Tensor): The zero points for int4, shape [M, N/group_size_int4].
+        block_size (int, optional): The size of the blocks for int8 dequantization. Default is 128.
+        group_size_int4 (int, optional): The size of the blocks for int4 dequantization. Default is 128.
 
     Returns:
         torch.Tensor: The dequantized tensor.
@@ -84,15 +105,17 @@ def weight_dequant(y: torch.Tensor, s: torch.Tensor, s4: torch.Tensor, z4: torch
     assert y.is_contiguous(), 'Input tensor must be contiguous'
     assert y.dim() == 2, 'Input tensors must have 2 dimensions'
     assert y.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-    assert block_size % block_size_int4 == 0, 'block_size must be divisible by block_size_int4'
+    assert block_size % group_size_int4 == 0, 'block_size must be divisible by group_size_int4'
 
     M, N = y.size()
     dequant_int4_x = torch.empty_like(y, dtype=torch.int8)
     dequant_int8_x = torch.empty_like(y, dtype=torch.float16)
 
-    grid = (triton.cdiv(M, block_size_int4), triton.cdiv(N, block_size_int4))
-    weight_dequant_int4_kernel[grid](y, dequant_int4_x, s4, z4, M, N, block_size_int4)
+    # First dequantize from int4 to int8
+    grid = (triton.cdiv(M, group_size_int4), triton.cdiv(N, group_size_int4))
+    weight_dequant_int4_kernel[grid](y, dequant_int4_x, s4, z4, M, N, group_size_int4)
 
+    # Then dequantize from int8 to float16
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
     weight_dequant_int8_kernel[grid](dequant_int4_x, dequant_int8_x, s, M, N, block_size)
 
@@ -182,47 +205,62 @@ def weight_quant_int8_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr
 @triton.jit
 def weight_quant_int4_kernel(y_ptr, s4_ptr, z4_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     """
-    Further quantizes the int8 tensor `y` to int4 using block-wise quantization.
-
-    Args:
-        y_ptr: Pointer to the input int8 tensor.
-        s4_ptr: Pointer to the scaling factors tensor for int4.
-        z4_ptr: Pointer to the zero points tensor for int4.
-        M: Number of rows in the input tensor.
-        N: Number of columns in the input tensor.
-        BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
-        BLOCK_SIZE_INT4 (tl.constexpr): The size of the block for int4 quantization.
-
-    Returns:
-        None
+    Further quantizes the int8 tensor `y` to int4 using per-row quantization.
+    Each row of 128 elements gets its own scale and zero point.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     n = tl.cdiv(N, BLOCK_SIZE)
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # Compute linear offsets for loading and storing
     offs = (offs_m[:, None] * N + offs_n[None, :])
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    # Load values
     y = tl.load(y_ptr + offs, mask=mask, other=0).to(tl.float32)
-    s4 = tl.extra.cuda.libdevice.round((tl.max(y) - tl.min(y)) / 15.0)  # Scale for int4
-    z4 = tl.extra.cuda.libdevice.round(-tl.min(y) / s4)  # Zero point for int4
-    y_uint4 = tl.clamp((
-        tl.extra.cuda.libdevice.round(y / s4) + z4), 0, 15).to(tl.int8)
+    
+    # Compute scale and zero point per row (dim=1)
+    max_vals = tl.max(y, axis=1)
+    min_vals = tl.min(y, axis=1)
+    s4 = tl.extra.cuda.libdevice.round((max_vals - min_vals) / 15.0)  # Scale for int4
+    z4 = tl.extra.cuda.libdevice.round(-min_vals / s4)  # Zero point for int4
+    
+    # Apply quantization with proper broadcasting
+    # s4 and z4 have shape [BLOCK_SIZE], need to reshape for broadcasting
+    s4_broadcast = s4[:, None]  # Shape: [BLOCK_SIZE, 1]
+    z4_broadcast = z4[:, None]  # Shape: [BLOCK_SIZE, 1]
+    
+    y_uint4 = tl.clamp(
+        tl.extra.cuda.libdevice.round(y / s4_broadcast) + z4_broadcast, 
+        0, 15
+    ).to(tl.int8)
+    
+    # Convert to target data types
     s4 = s4.to(tl.int8)
     z4 = z4.to(tl.int8)
+    
+    # Store quantized values
     tl.store(y_ptr + offs, y_uint4, mask=mask)
-    tl.store(s4_ptr + pid_m * n + pid_n, s4)
-    tl.store(z4_ptr + pid_m * n + pid_n, z4)
+    
+    # Store one scale and zero point per row (1×128 granularity)
+    # Each row in the block gets its own scale and zero point
+    row_offsets = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_mask = row_offsets < M
+    col_idx = pid_n  # Store at the beginning of each block
+    
+    tl.store(s4_ptr + row_offsets * n + col_idx, s4, mask=row_mask)
+    tl.store(z4_ptr + row_offsets * n + col_idx, z4, mask=row_mask)
 
 
-def weight_quant(x: torch.Tensor, block_size: int = 128, block_size_int4: int = 16) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 128) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization and further quantizes to int4.
 
     Args:
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous.
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
-        block_size_int4 (int, optional): The size of the blocks for int4 quantization. Default is 16.
+        group_size_int4 (int, optional): The size of the blocks for int4 quantization. Default is 128.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: The quantized tensor, the scaling factors for int8, the scaling factors for int4, and the zero points for int4.
@@ -230,23 +268,21 @@ def weight_quant(x: torch.Tensor, block_size: int = 128, block_size_int4: int = 
     assert x.is_contiguous(), 'Input tensor must be contiguous'
     assert x.dim() == 2, 'Input tensors must have 2 dimensions'
     assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-    assert block_size % block_size_int4 == 0, 'block_size must be divisible by block_size_int4'
+    assert block_size % group_size_int4 == 0, 'block_size must be divisible by group_size_int4'
 
     M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.int8) # dtype int8, actually uint4, needs to pack
+    y = torch.empty_like(x, dtype=torch.int8) # todo: dtype int8, actually uint4, needs to pack
     s = x.new_empty(((M + block_size - 1) // block_size, (N + block_size - 1) // block_size), dtype=torch.float16)
-    s4 = x.new_empty(((M + block_size_int4 - 1) // block_size_int4, 
-                      (N + block_size_int4 - 1) // block_size_int4), dtype=torch.int8) # dtype int8
-    z4 = x.new_empty(((M + block_size_int4 - 1) // block_size_int4, 
-                      (N + block_size_int4 - 1) // block_size_int4), dtype=torch.int8) # dtype int8, actually uint4, needs to pack
+    s4 = x.new_empty(M, (N + group_size_int4 - 1) // group_size_int4, dtype=torch.int8) # dtype int8
+    z4 = x.new_empty(M, (N + group_size_int4 - 1) // group_size_int4, dtype=torch.int8) # dtype int8, actually uint4, needs to pack
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
     # grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_quant_int8_kernel[grid](x, y, s, M, N, block_size)
 
-    grid = (triton.cdiv(M, block_size_int4), triton.cdiv(N, block_size_int4))
+    grid = (triton.cdiv(M, group_size_int4), triton.cdiv(N, group_size_int4))
     # grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
-    weight_quant_int4_kernel[grid](y, s4, z4, M, N, block_size_int4)
+    weight_quant_int4_kernel[grid](y, s4, z4, M, N, group_size_int4)
 
     return y, s, s4, z4
 
@@ -262,71 +298,86 @@ def w4a8_gemm_kernel(a_ptr, b_ptr, c_ptr,
                     a_s_ptr, b_s_ptr,
                     b_s4_ptr, b_z4_ptr,
                     M, N: tl.constexpr, K: tl.constexpr,
-                    BLOCK_SIZE_INT4: tl.constexpr,
+                    GROUP_SIZE_INT4: tl.constexpr,
                     BLOCK_SIZE_M: tl.constexpr,
                     BLOCK_SIZE_N: tl.constexpr,
                     BLOCK_SIZE_K: tl.constexpr):
     """
-    Performs a matrix multiplication operation on FP8 matrices with scaling factors.
+    Performs a matrix multiplication operation with int8 activations and int4 weights.
 
     Args:
-        a_ptr (tl.tensor): Pointer to the first input matrix A.
-        b_ptr (tl.tensor): Pointer to the second input matrix B.
+        a_ptr (tl.tensor): Pointer to the first input matrix A (int8 activations).
+        b_ptr (tl.tensor): Pointer to the second input matrix B (int4 weights).
         c_ptr (tl.tensor): Pointer to the output matrix C.
         a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
-        b_s_ptr (tl.tensor): Pointer to the scaling factors for matrix B.
-        b_s4_ptr (tl.tensor): Pointer to the scaling factors for int4 quantization of matrix B.
-        b_z4_ptr (tl.tensor): Pointer to the zero points for int4 quantization of matrix B.
+        b_s_ptr (tl.tensor): Pointer to the int8 scaling factors for matrix B.
+        b_s4_ptr (tl.tensor): Pointer to the int4 scaling factors for matrix B.
+        b_z4_ptr (tl.tensor): Pointer to the int4 zero points for matrix B.
         M (int): Number of rows in matrix A and C.
         N (tl.constexpr): Number of columns in matrix B and C.
         K (tl.constexpr): Number of columns in matrix A and rows in matrix B.
         BLOCK_SIZE_M (tl.constexpr): Block size for the M dimension.
         BLOCK_SIZE_N (tl.constexpr): Block size for the N dimension.
-        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension. Aligns with the int8 quantization block size.
-
-    Returns:
-        None
+        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension.
+        GROUP_SIZE_INT4 (tl.constexpr): group size for int4 quantization (128).
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     k = tl.cdiv(K, BLOCK_SIZE_K)
-    k_int4 = tl.cdiv(K, BLOCK_SIZE_INT4)
+    k_int4 = tl.cdiv(K, GROUP_SIZE_INT4)
+    
+    # Calculate offsets
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :] # (BLOCK_M, BLOCK_K)
-    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None] # (BLOCK_K, BLOCK_N)
-    a_s_ptrs = a_s_ptr + offs_m * k # (BLOCK_M,) ,activation quant block (1, 128)
-    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k # (BLOCK_N,) ,weight quant block (128, 128)
+    
+    # Pointers to input matrices
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]  # (BLOCK_M, BLOCK_K)
+    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]  # (BLOCK_K, BLOCK_N)
+    
+    # Pointers to int8 scaling factors
+    a_s_ptrs = a_s_ptr + offs_m * k  # (BLOCK_M,), activation quant block (1, 128)
+    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k  # (BLOCK_N,), weight quant block (128, 128)
 
-    int4_offs_n = (offs_n // BLOCK_SIZE_INT4) #(BLOCK_N,)
-    int4_offs_k = (offs_k // BLOCK_SIZE_INT4) #(BLOCK_K,)
-    b_s4_ptrs = b_s4_ptr + int4_offs_n[None, :] * k_int4 + int4_offs_k[:, None] # (BLOCK_K, BLOCK_N)
-    b_z4_ptrs = b_z4_ptr + int4_offs_n[None, :] * k_int4 + int4_offs_k[:, None] # (BLOCK_K, BLOCK_N)
-
-
+    # Pointers to int4 scaling factors and zero points
+    b_s4_ptrs = b_s4_ptr + offs_n[None, :] * k_int4 + offs_k[:, None] // GROUP_SIZE_INT4 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    b_z4_ptrs = b_z4_ptr + offs_n[None, :] * k_int4 + offs_k[:, None] // GROUP_SIZE_INT4 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    
+    # Initialize accumulator
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Main loop over K dimension
     for i in range(k):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
 
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
+
+        # int4_s and int4_z is int8 dtype
+        # the int4 dequantization output is int8 dtype
         int4_s = tl.load(b_s4_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=1.0)
         int4_z = tl.load(b_z4_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
-
+        b_dequant = (b - int4_z) * int4_s
+        # tl.static_print("dequant int4:", b_dequant.dtype)
+        
+        # Load int8 scales
         a_s = tl.load(a_s_ptrs).to(tl.float32)
         b_s = tl.load(b_s_ptrs).to(tl.float32)
-        # dequantize_scale = a_s[:, None] * b_s[None, :]
-        # shape -> (BLOCK_M, BLOCK_N)
-        # tl.static_print("dequant int4:", ((b - int4_z) * int4_s).dtype)
-        b = ((b - int4_z) * int4_s)
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K # row-major, ptrs move along K
+        
+        # Compute matrix multiplication with scales
+        accumulator += tl.dot(a, b_dequant) * a_s[:, None] * b_s[None, :]
+        
+        # Update pointers for next iteration
+        a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K
         a_s_ptrs += 1
         b_s_ptrs += 1
-        b_s4_ptrs += (BLOCK_SIZE_K // BLOCK_SIZE_INT4)
-        b_z4_ptrs += (BLOCK_SIZE_K // BLOCK_SIZE_INT4)
+        b_s4_ptrs += (BLOCK_SIZE_K // GROUP_SIZE_INT4)
+        b_z4_ptrs += (BLOCK_SIZE_K // GROUP_SIZE_INT4)
+    
+    # Convert accumulator to output dtype
     c = accumulator.to(c_ptr.dtype.element_ty)
+    
+    # Store results
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
@@ -335,7 +386,7 @@ def w4a8_gemm_kernel(a_ptr, b_ptr, c_ptr,
 
 
 def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, 
-              b_s: torch.Tensor, b_s4: torch.Tensor, b_z4: torch.Tensor, BLOCK_SIZE_INT4: int=16) -> torch.Tensor:
+              b_s: torch.Tensor, b_s4: torch.Tensor, b_z4: torch.Tensor, GROUP_SIZE_INT4: int=128) -> torch.Tensor:
     """
     Perform a matrix multiplication using int8 precision.
 
@@ -346,7 +397,7 @@ def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor,
         b_s (torch.Tensor): The int8 scaling factor for the second input matrix, must be contiguous.
         b_s4 (torch.Tensor): The int4 scaling factor for the second input matrix for int4 quantization, must be contiguous.
         b_z4 (torch.Tensor): The int4 zero point for the second input matrix for int4 quantization, must be contiguous.
-        block_size_int4 (int, optional): The block size for int4 quantization. Default is 16.
+        group_size_int4 (int, optional): The block size for int4 quantization. Default is 16.
 
     Returns:
         torch.Tensor: The result of the matrix multiplication.
@@ -362,13 +413,13 @@ def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor,
     N = b.size(0)
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
-    w4a8_gemm_kernel[grid](a, b, c, a_s, b_s, b_s4, b_z4, M, N, K, BLOCK_SIZE_INT4)
+    w4a8_gemm_kernel[grid](a, b, c, a_s, b_s, b_s4, b_z4, M, N, K, GROUP_SIZE_INT4)
     return c
 
 
 def test_w4a8_gemm():
     # Create random tensors for a and b
-    a = torch.randn(256, 7168, dtype=torch.float16, device='cuda').contiguous()
+    a = torch.randn(1024, 7168, dtype=torch.float16, device='cuda').contiguous()
     b = torch.randn(512, 7168, dtype=torch.float16, device='cuda').contiguous()
     
     # Quantize tensors
