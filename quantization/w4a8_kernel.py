@@ -7,6 +7,7 @@ import triton.language as tl
 from triton import Config
 from typing import Tuple
 
+from quant_utils import Int4QuantUtils
 
 @triton.jit
 def weight_dequant_int8_kernel(y_ptr, x_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -106,6 +107,8 @@ def weight_dequant(y: torch.Tensor, s: torch.Tensor, s4: torch.Tensor, z4: torch
     assert y.dim() == 2, 'Input tensors must have 2 dimensions'
     assert y.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
     assert block_size % group_size_int4 == 0, 'block_size must be divisible by group_size_int4'
+
+    y = Int4QuantUtils.unpack(y, storage_bits=32, q_bits=4, direction="row")
 
     M, N = y.size()
     dequant_int4_x = torch.empty_like(y, dtype=torch.int8)
@@ -284,7 +287,9 @@ def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 
     # grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_quant_int4_kernel[grid](y, s4, z4, M, N, group_size_int4)
 
-    return y, s, s4, z4
+    y_packed = Int4QuantUtils.pack(y, storage_bits=32, q_bits=4, direction="row")
+
+    return y_packed, s, s4, z4
 
 
 w4a8_gemm_configs = [
@@ -405,6 +410,9 @@ def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor,
     # a for int8 activation, shape (M, K), (bsz*seq_len, hidden_size)
     # b for int4 weight,     shape (N, K), (out_features, in_features) (out_features, hidden_size)
     # gemm -> a @ b_t
+
+    # TODO: move unpack function to the w4a8_gemm_kernel inside
+    b = Int4QuantUtils.unpack(b, storage_bits=32, q_bits=4, direction="row")
     assert a.is_contiguous() and b.is_contiguous(), 'Input tensors must be contiguous'
     assert a_s.is_contiguous() and b_s.is_contiguous(), 'Scaling factor tensors must be contiguous'
     assert b_s4.is_contiguous() and b_z4.is_contiguous(), 'Scaling factor and zero point tensors must be contiguous'
@@ -420,7 +428,7 @@ def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor,
 def test_w4a8_gemm():
     # Create random tensors for a and b
     a = torch.randn(1024, 7168, dtype=torch.float16, device='cuda').contiguous()
-    b = torch.randn(512, 7168, dtype=torch.float16, device='cuda').contiguous()
+    b = torch.randn(1024, 7168, dtype=torch.float16, device='cuda').contiguous()
     
     # Quantize tensors
     a_quant, a_s = act_quant(a)
@@ -434,12 +442,12 @@ def test_w4a8_gemm():
     assert c.isnan().sum() == 0, 'Result of int8 GEMM contains NaNs'
     assert c.isinf().sum() == 0, 'Result of int8 GEMM contains Infs'
 
-    cos_sim = torch.nn.functional.cosine_similarity(c.view(-1), c_float.view(-1), dim=0)
+    cos_sim = torch.nn.functional.cosine_similarity(c.view(-1).float(), c_float.view(-1).float(), dim=0)
     print (f'Cosine similarity with float32 GEMM: {cos_sim.item()}')
 
 def test_weight_quant_dequant():
     # Create a random FP16 tensor
-    x = torch.randn(256, 7168, dtype=torch.float16, device='cuda').contiguous()
+    x = torch.randn(1024, 7168, dtype=torch.float16, device='cuda').contiguous()
     
     # Quantize the tensor
     y_quant, s, s4, z4 = weight_quant(x)
@@ -448,7 +456,7 @@ def test_weight_quant_dequant():
     x_dequant = weight_dequant(y_quant, s, s4, z4)
     
     # Calculate cosine similarity between the original and dequantized tensors
-    cos_sim = torch.nn.functional.cosine_similarity(x.view(-1), x_dequant.view(-1), dim=0)
+    cos_sim = torch.nn.functional.cosine_similarity(x.view(-1).float(), x_dequant.view(-1).float(), dim=0)
     
     print(f'Cosine similarity between original and dequantized tensor: {cos_sim.item()}')
 
