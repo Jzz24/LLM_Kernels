@@ -8,6 +8,10 @@ from triton import Config
 from typing import Tuple
 
 from quant_utils import Int4QuantUtils
+from bitpack import pack_weights_over_rows
+
+PACKING_BITS = 32
+W_BITS = 4
 
 @triton.jit
 def weight_dequant_int8_kernel(y_ptr, x_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -38,23 +42,27 @@ def weight_dequant_int8_kernel(y_ptr, x_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constex
     tl.store(x_ptr + offs, x, mask=mask)
 
 @triton.jit
-def weight_dequant_int4_kernel(y_ptr, x_ptr, s4_ptr, z4_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+def weight_dequant_int4_kernel(y_ptr, x_ptr, s4_ptr, z4_ptr, M, N, 
+                               BLOCK_SIZE: tl.constexpr,
+                               GROUP_SIZE: tl.constexpr,
+                               unpack_mask: tl.constexpr = 0x0F,
+                               elements_per_sample: tl.constexpr = 8,
+                               w_bits: tl.constexpr = 4):
     """
-    Dequantizes the int4 tensor `y` to float32 using per-row (1×128) dequantization.
-    Each row of 128 elements uses its own scale and zero point.
-
+    Dequantizes the packed uint4 tensor `y` to int8 using per-row quantization.
+    
     Args:
-        y_ptr: Pointer to the input int4 tensor.
+        y_ptr: Pointer to the packed input uint4 tensor.
         x_ptr: Pointer to the output dequantized tensor.
-        s4_ptr: Pointer to the scaling factors tensor for int4.
-        z4_ptr: Pointer to the zero points tensor for int4.
+        s4_ptr: Pointer to the scaling factors tensor.
+        z4_ptr: Pointer to the zero points tensor.
         M: Number of rows in the input tensor.
         N: Number of columns in the input tensor.
-        BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
+        BLOCK_SIZE: The processing block size (can be different from GROUP_SIZE).
+        GROUP_SIZE: The quantization group size for scales/zeros (typically 128).
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-    n = tl.cdiv(N, BLOCK_SIZE)
     
     # Calculate offsets for this block
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -64,32 +72,39 @@ def weight_dequant_int4_kernel(y_ptr, x_ptr, s4_ptr, z4_ptr, M, N, BLOCK_SIZE: t
     offs = (offs_m[:, None] * N + offs_n[None, :])
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     
-    # Load quantized values
-    y = tl.load(y_ptr + offs, mask=mask, other=0).to(tl.int8)
+    # Load packed values
+    packed_offs = (offs_m[:, None] // elements_per_sample * N + offs_n[None, :])
+    packed_y = tl.load(y_ptr + packed_offs, mask=mask, other=0)
+
+    # Unpack
+    shift = offs_m[:, None] % elements_per_sample * w_bits
+    unpacked_y = ((packed_y >> shift) & unpack_mask).to(tl.int8)
     
-    # For each row in this block, load its scale and zero point
-    # Each row has its own s4 and z4 for every 128 columns
-    row_offsets = offs_m
-    col_idx = pid_n  # Column index for this block's scale/zero
+    # Calculate scale/zero indices based on GROUP_SIZE
+    # Each row has scales/zeros for every GROUP_SIZE columns
+    blocks_per_row = tl.cdiv(N, GROUP_SIZE)
+    group_idx = offs_n[None, :] // GROUP_SIZE
     
-    # Load scales and zero points with proper broadcasting
-    s4 = tl.load(s4_ptr + row_offsets * n + col_idx, mask=row_offsets < M, other=1).to(tl.int8)
-    z4 = tl.load(z4_ptr + row_offsets * n + col_idx, mask=row_offsets < M, other=0).to(tl.int8)
+    # For each element, find its proper scale/zero
+    # Each row's scales are stored consecutively in groups of blocks_per_row
+    scale_offs = offs_m[:, None] * blocks_per_row + group_idx
+    scale_mask = (offs_m[:, None] < M) & (group_idx < blocks_per_row)
     
-    # Reshape for broadcasting
-    s4_broadcast = s4[:, None]  # Shape: [BLOCK_SIZE, 1]
-    z4_broadcast = z4[:, None]  # Shape: [BLOCK_SIZE, 1]
+    # Load scales and zeros
+    s4_vals = tl.load(s4_ptr + scale_offs, mask=scale_mask, other=1).to(tl.int8)
+    z4_vals = tl.load(z4_ptr + scale_offs, mask=scale_mask, other=0).to(tl.int8)
     
     # Dequantize
-    x = (y - z4_broadcast) * s4_broadcast
+    x = (unpacked_y - z4_vals) * s4_vals
     
     # Store results
     tl.store(x_ptr + offs, x, mask=mask)
 
+
 def weight_dequant(y: torch.Tensor, s: torch.Tensor, s4: torch.Tensor, z4: torch.Tensor, 
-                  block_size: int = 128, group_size_int4: int = 128) -> torch.Tensor:
+                  block_size: int = 128, group_size_int4: int = 128, pack_direction: str = "row") -> torch.Tensor:
     """
-    Dequantizes the input tensor `y` from int4 to float32 using block-wise dequantization.
+    Dequantizes the input tensor `y` from int4 to float16 using block-wise dequantization.
     The int4 quantization has a granularity of 1×128 (one scale+zero point per row per 128 columns).
 
     Args:
@@ -107,20 +122,22 @@ def weight_dequant(y: torch.Tensor, s: torch.Tensor, s4: torch.Tensor, z4: torch
     assert y.dim() == 2, 'Input tensors must have 2 dimensions'
     assert y.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
     assert block_size % group_size_int4 == 0, 'block_size must be divisible by group_size_int4'
-
-    y = Int4QuantUtils.unpack(y, storage_bits=32, q_bits=4, direction="row")
+    assert pack_direction == "row", "Only row packing is supported for dequantization"
 
     M, N = y.size()
-    dequant_int4_x = torch.empty_like(y, dtype=torch.int8)
-    dequant_int8_x = torch.empty_like(y, dtype=torch.float16)
+    elements_per_sample = PACKING_BITS // W_BITS
+    UNPACK_M = M * elements_per_sample
+    dequant_int4_x = torch.empty((UNPACK_M, N), dtype=torch.int8, device=y.device)
+    dequant_int8_x = torch.empty((UNPACK_M, N), dtype=torch.float16, device=y.device)
 
     # First dequantize from int4 to int8
-    grid = (triton.cdiv(M, group_size_int4), triton.cdiv(N, group_size_int4))
-    weight_dequant_int4_kernel[grid](y, dequant_int4_x, s4, z4, M, N, group_size_int4)
-
+    grid = (triton.cdiv(UNPACK_M, group_size_int4), triton.cdiv(N, group_size_int4))
+    weight_dequant_int4_kernel[grid](y, dequant_int4_x, s4, z4, UNPACK_M, N, block_size, group_size_int4, 
+                                     2**W_BITS - 1, elements_per_sample, W_BITS)
+    
     # Then dequantize from int8 to float16
-    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    weight_dequant_int8_kernel[grid](dequant_int4_x, dequant_int8_x, s, M, N, block_size)
+    grid = (triton.cdiv(UNPACK_M, block_size), triton.cdiv(N, block_size))
+    weight_dequant_int8_kernel[grid](dequant_int4_x, dequant_int8_x, s, UNPACK_M, N, block_size)
 
     return dequant_int8_x
 
@@ -143,7 +160,8 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
     s = tl.max(tl.abs(x)) / 127.
-    y = tl.extra.cuda.libdevice.round(x / s)
+    # y = tl.extra.cuda.libdevice.round(x / s)
+    y = tl.floor(x / s + 0.5)
     y = y.to(y_ptr.dtype.element_ty)
     s = s.to(s_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
@@ -200,63 +218,52 @@ def weight_quant_int8_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask, other=0).to(tl.float32)
     s = tl.max(tl.abs(x)) / 119.0
-    y = tl.clamp(tl.extra.cuda.libdevice.round(x / s), -119.0, 119.0).to(tl.int8)
+    # y = tl.clamp(tl.extra.cuda.libdevice.round(x / s), -119.0, 119.0).to(tl.int8)
+    y = tl.clamp(tl.floor(x / s + 0.5), -119.0, 119.0).to(tl.int8)
     s = s.to(tl.float16)
     tl.store(s_ptr + pid_m * n + pid_n, s)
     tl.store(y_ptr + offs, y, mask=mask)
+
 
 @triton.jit
 def weight_quant_int4_kernel(y_ptr, s4_ptr, z4_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     """
     Further quantizes the int8 tensor `y` to int4 using per-row quantization.
-    Each row of 128 elements gets its own scale and zero point.
+    Each row of BLOCK_SIZE elements gets its own scale and zero point.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-    n = tl.cdiv(N, BLOCK_SIZE)
+    blocks_per_row = tl.cdiv(N, BLOCK_SIZE)
+    
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    # Compute linear offsets for loading and storing
+    
     offs = (offs_m[:, None] * N + offs_n[None, :])
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     
-    # Load values
     y = tl.load(y_ptr + offs, mask=mask, other=0).to(tl.float32)
     
-    # Compute scale and zero point per row (dim=1)
     max_vals = tl.max(y, axis=1)
     min_vals = tl.min(y, axis=1)
-    s4 = tl.extra.cuda.libdevice.round((max_vals - min_vals) / 15.0)  # Scale for int4
-    z4 = tl.extra.cuda.libdevice.round(-min_vals / s4)  # Zero point for int4
-    
-    # Apply quantization with proper broadcasting
-    # s4 and z4 have shape [BLOCK_SIZE], need to reshape for broadcasting
-    s4_broadcast = s4[:, None]  # Shape: [BLOCK_SIZE, 1]
-    z4_broadcast = z4[:, None]  # Shape: [BLOCK_SIZE, 1]
+    s4 = tl.floor((max_vals - min_vals) / 15.0 + 0.5)
+    z4 = tl.floor(-min_vals / s4 + 0.5)
     
     y_uint4 = tl.clamp(
-        tl.extra.cuda.libdevice.round(y / s4_broadcast) + z4_broadcast, 
+        tl.floor(y / s4[:, None] + 0.5) + z4[:, None], 
         0, 15
     ).to(tl.int8)
     
-    # Convert to target data types
-    s4 = s4.to(tl.int8)
-    z4 = z4.to(tl.int8)
-    
-    # Store quantized values
     tl.store(y_ptr + offs, y_uint4, mask=mask)
+
+    row_mask = offs_m < M
+    scale_offs = offs_m * blocks_per_row + pid_n
     
-    # Store one scale and zero point per row (1×128 granularity)
-    # Each row in the block gets its own scale and zero point
-    row_offsets = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    row_mask = row_offsets < M
-    col_idx = pid_n  # Store at the beginning of each block
-    
-    tl.store(s4_ptr + row_offsets * n + col_idx, s4, mask=row_mask)
-    tl.store(z4_ptr + row_offsets * n + col_idx, z4, mask=row_mask)
+    tl.store(s4_ptr + scale_offs, s4.to(tl.int8), mask=row_mask)
+    tl.store(z4_ptr + scale_offs, z4.to(tl.int8), mask=row_mask)
 
 
-def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 128) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 128, 
+                 pack_direction: str = "row") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization and further quantizes to int4.
 
@@ -264,6 +271,7 @@ def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous.
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
         group_size_int4 (int, optional): The size of the blocks for int4 quantization. Default is 128.
+        pack_direction (str, optional): The direction for packing the quantized weights. Default is "row".
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: The quantized tensor, the scaling factors for int8, the scaling factors for int4, and the zero points for int4.
@@ -274,7 +282,7 @@ def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 
     assert block_size % group_size_int4 == 0, 'block_size must be divisible by group_size_int4'
 
     M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.int8) # todo: dtype int8, actually uint4, needs to pack
+    y = torch.empty_like(x, dtype=torch.int8) # todo: dtype int8, actually uint4, needs to pack to int32
     s = x.new_empty(((M + block_size - 1) // block_size, (N + block_size - 1) // block_size), dtype=torch.float16)
     s4 = x.new_empty(M, (N + group_size_int4 - 1) // group_size_int4, dtype=torch.int8) # dtype int8
     z4 = x.new_empty(M, (N + group_size_int4 - 1) // group_size_int4, dtype=torch.int8) # dtype int8, actually uint4, needs to pack
@@ -287,7 +295,16 @@ def weight_quant(x: torch.Tensor, block_size: int = 128, group_size_int4: int = 
     # grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_quant_int4_kernel[grid](y, s4, z4, M, N, group_size_int4)
 
-    y_packed = Int4QuantUtils.pack(y, storage_bits=32, q_bits=4, direction="row")
+    # Pack the uint4 weight into int32
+    # Note: the int4 weight should shift to uint4, due to triton shift bugs with negative values !
+    assert y.min() >= 0 and y.max() <= 15, 'Quantized values must be in the range [0, 15]'
+
+    # y_packed = Int4QuantUtils.pack(y, storage_bits=32, q_bits=4, direction="row")
+    if pack_direction == "row":
+        assert M % (PACKING_BITS // W_BITS) == 0, f'row nums must be divisible by {PACKING_BITS // W_BITS}'
+        y_packed, elements_per_sample = pack_weights_over_rows(y, W_BITS, PACKING_BITS, transpose=False)
+    elif pack_direction == "col":
+        pass
 
     return y_packed, s, s4, z4
 
@@ -463,4 +480,4 @@ def test_weight_quant_dequant():
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float16)
     test_weight_quant_dequant()
-    test_w4a8_gemm()
+    # test_w4a8_gemm()
