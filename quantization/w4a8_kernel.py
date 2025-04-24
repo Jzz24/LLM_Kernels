@@ -323,62 +323,63 @@ def w4a8_gemm_kernel(a_ptr, b_ptr, c_ptr,
                     GROUP_SIZE_INT4: tl.constexpr,
                     BLOCK_SIZE_M: tl.constexpr,
                     BLOCK_SIZE_N: tl.constexpr,
-                    BLOCK_SIZE_K: tl.constexpr):
+                    BLOCK_SIZE_K: tl.constexpr,
+                    elements_per_sample: tl.constexpr = 8,
+                    w_bits: tl.constexpr = 4,
+                    unpack_mask: tl.constexpr = 0x0F):
     """
-    Performs a matrix multiplication operation with int8 activations and int4 weights.
-
-    Args:
-        a_ptr (tl.tensor): Pointer to the first input matrix A (int8 activations).
-        b_ptr (tl.tensor): Pointer to the second input matrix B (int4 weights).
-        c_ptr (tl.tensor): Pointer to the output matrix C.
-        a_s_ptr (tl.tensor): Pointer to the scaling factors for matrix A.
-        b_s_ptr (tl.tensor): Pointer to the int8 scaling factors for matrix B.
-        b_s4_ptr (tl.tensor): Pointer to the int4 scaling factors for matrix B.
-        b_z4_ptr (tl.tensor): Pointer to the int4 zero points for matrix B.
-        M (int): Number of rows in matrix A and C.
-        N (tl.constexpr): Number of columns in matrix B and C.
-        K (tl.constexpr): Number of columns in matrix A and rows in matrix B.
-        BLOCK_SIZE_M (tl.constexpr): Block size for the M dimension.
-        BLOCK_SIZE_N (tl.constexpr): Block size for the N dimension.
-        BLOCK_SIZE_K (tl.constexpr): Block size for the K dimension.
-        GROUP_SIZE_INT4 (tl.constexpr): group size for int4 quantization (128).
+    Performs matrix multiplication with int8 activations and packed int4 weights.
+    Directly unpacks and dequantizes weights in one fused operation.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     k = tl.cdiv(K, BLOCK_SIZE_K)
     k_int4 = tl.cdiv(K, GROUP_SIZE_INT4)
     
-    # Calculate offsets
+    # Calculate offsets for activations (int8)
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     
-    # Pointers to input matrices
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]  # (BLOCK_M, BLOCK_K)
-    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]  # (BLOCK_K, BLOCK_N)
+    # Activation pointers (int8)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
     
-    # Pointers to int8 scaling factors
-    a_s_ptrs = a_s_ptr + offs_m * k  # (BLOCK_M,), activation quant block (1, 128)
-    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k  # (BLOCK_N,), weight quant block (128, 128)
-
-    # Pointers to int4 scaling factors and zero points
-    b_s4_ptrs = b_s4_ptr + offs_n[None, :] * k_int4 + offs_k[:, None] // GROUP_SIZE_INT4 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-    b_z4_ptrs = b_z4_ptr + offs_n[None, :] * k_int4 + offs_k[:, None] // GROUP_SIZE_INT4 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    # Pointers for packed weights - need to adjust for packing
+    # For each element in offs_n, we need the correct packed word containing int4 values
+    packed_offs_n = offs_n // elements_per_sample
+    b_ptrs = b_ptr + packed_offs_n[None, :] * K + offs_k[:, None]
+    
+    # Scale pointers
+    a_s_ptrs = a_s_ptr + offs_m * k
+    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k
+    
+    # Int4 scale and zero pointers
+    b_s4_ptrs = b_s4_ptr + offs_n[None, :] * k_int4 + offs_k[:, None] // GROUP_SIZE_INT4
+    b_z4_ptrs = b_z4_ptr + offs_n[None, :] * k_int4 + offs_k[:, None] // GROUP_SIZE_INT4
     
     # Initialize accumulator
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
     # Main loop over K dimension
     for i in range(k):
-
+        # Load activations
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
-
-        # int4_s and int4_z is int8 dtype
-        # the int4 dequantization output is int8 dtype
+        
+        # Load packed weights
+        packed_b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0)
+        
+        # Calculate bit shifts based on position within packed word
+        shifts = (offs_n % elements_per_sample) * w_bits
+        
+        # Unpack int4 values with shifting and masking
+        b_unpacked = ((packed_b >> shifts[None, :]) & unpack_mask).to(tl.int8)
+        
+        # Load int4 scales and zero points
         int4_s = tl.load(b_s4_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=1.0)
         int4_z = tl.load(b_z4_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
-        b_dequant = (b - int4_z) * int4_s
+        
+        # Dequantize int4 weights in one step
+        b_dequant = (b_unpacked - int4_z) * int4_s
         # tl.static_print("dequant int4:", b_dequant.dtype)
         
         # Load int8 scales
@@ -396,19 +397,16 @@ def w4a8_gemm_kernel(a_ptr, b_ptr, c_ptr,
         b_s4_ptrs += (BLOCK_SIZE_K // GROUP_SIZE_INT4)
         b_z4_ptrs += (BLOCK_SIZE_K // GROUP_SIZE_INT4)
     
-    # Convert accumulator to output dtype
-    c = accumulator.to(c_ptr.dtype.element_ty)
-    
     # Store results
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c = accumulator.to(c_ptr.dtype.element_ty)
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=mask)
 
-
 def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, 
-              b_s: torch.Tensor, b_s4: torch.Tensor, b_z4: torch.Tensor, GROUP_SIZE_INT4: int=128) -> torch.Tensor:
+              b_s: torch.Tensor, b_s4: torch.Tensor, b_z4: torch.Tensor, 
+              GROUP_SIZE_INT4: int=128, elements_per_sample: int=8,
+              pack_direction: str = "row") -> torch.Tensor:
     """
     Perform a matrix multiplication using int8 precision.
 
@@ -420,25 +418,33 @@ def w4a8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor,
         b_s4 (torch.Tensor): The int4 scaling factor for the second input matrix for int4 quantization, must be contiguous.
         b_z4 (torch.Tensor): The int4 zero point for the second input matrix for int4 quantization, must be contiguous.
         group_size_int4 (int, optional): The block size for int4 quantization. Default is 16.
+        elements_per_sample (int, optional): The number of elements per sample for packing. Default is 8.
+        pack_direction (str, optional): The direction for packing the quantized weights. Default is "row".
 
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
     # a for int8 activation, shape (M, K), (bsz*seq_len, hidden_size)
-    # b for int4 weight,     shape (N, K), (out_features, in_features) (out_features, hidden_size)
+    # b for packed int4 weight, shape (N // elements_per_sample, K), (out_features // elements_per_sample, in_features)
     # gemm -> a @ b_t
 
     # TODO: move unpack function to the w4a8_gemm_kernel inside
-    b = Int4QuantUtils.unpack(b, storage_bits=32, q_bits=4, direction="row")
+    # b = Int4QuantUtils.unpack(b, storage_bits=32, q_bits=4, direction="row")
     assert a.is_contiguous() and b.is_contiguous(), 'Input tensors must be contiguous'
     assert a_s.is_contiguous() and b_s.is_contiguous(), 'Scaling factor tensors must be contiguous'
     assert b_s4.is_contiguous() and b_z4.is_contiguous(), 'Scaling factor and zero point tensors must be contiguous'
+    assert pack_direction == "row", "Only row packing is supported for dequantization"
+
     K = a.size(-1)
     M = a.numel() // K
-    N = b.size(0)
+    N = b.size(0) * elements_per_sample
+
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
-    w4a8_gemm_kernel[grid](a, b, c, a_s, b_s, b_s4, b_z4, M, N, K, GROUP_SIZE_INT4)
+    w4a8_gemm_kernel[grid](a, b, c, a_s, b_s, b_s4, b_z4, M, N, K, GROUP_SIZE_INT4,
+                           elements_per_sample=elements_per_sample, 
+                           w_bits=W_BITS,
+                           unpack_mask = 2**W_BITS - 1)
     return c
 
 
@@ -452,7 +458,7 @@ def test_w4a8_gemm():
     b_quant, b_s, b_s4, b_z4 = weight_quant(b)
 
     # Perform int8 GEMM
-    c = w4a8_gemm(a_quant, a_s, b_quant, b_s, b_s4, b_z4)
+    c = w4a8_gemm(a_quant, a_s, b_quant, b_s, b_s4, b_z4, 128, PACKING_BITS // W_BITS, "row")
     c_float = a.matmul(b.t())
     
     # Print the result
@@ -480,4 +486,4 @@ def test_weight_quant_dequant():
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float16)
     test_weight_quant_dequant()
-    # test_w4a8_gemm()
+    test_w4a8_gemm()
