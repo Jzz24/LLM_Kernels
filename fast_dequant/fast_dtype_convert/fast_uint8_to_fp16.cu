@@ -41,7 +41,7 @@ __global__ void uint8_to_fp16_kernel(const uint8_t* input, __half* output, int s
                      : "=r"(h[1]) 
                      : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
         
-        // 减去魔法数(1152)转换回有符号值
+        // 减去魔法数0x6480(1024+128)转换回有符号值
         asm volatile("sub.f16x2 %0, %1, %2;\n" 
                      : "=r"(h[0]) 
                      : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
