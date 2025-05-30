@@ -65,25 +65,30 @@ def test_marlin_w4a16_gemm():
     # 3. Pack weights to Marlin format
     packed_weight, packed_scales = QuantUtils.pack(W_int4, scales, groupsize=groupsize)
     
-    # 4. Reference computation
-    torch.cuda.synchronize()
-    start_time = time.time()
+    # 4. Reference computation with CUDA events
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    # torch.cuda.synchronize()
+    start_event.record()
     C_ref = torch.matmul(A, ref_dequant)
+    end_event.record()
     torch.cuda.synchronize()
-    ref_time = time.time() - start_time
+    ref_time = start_event.elapsed_time(end_event)
     
     # 5. Marlin computation
     C_marlin = torch.zeros(M, N, dtype=torch.half, device=device)
     workspace = torch.zeros(N // 128 * 16, dtype=torch.int32, device=device) # unused
     
-    torch.cuda.synchronize()
-    start_time = time.time()
+
+    start_event.record()
     mul(A, packed_weight, C_marlin, packed_scales, workspace)
+    end_event.record()
     torch.cuda.synchronize()
-    marlin_time = time.time() - start_time
+    marlin_time = start_event.elapsed_time(end_event)
     
-    print(f"Reference time: {ref_time*1000:.2f}ms")
-    print(f"Marlin time: {marlin_time*1000:.2f}ms")
+    print(f"Reference time: {ref_time:.2f}ms")
+    print(f"Marlin time: {marlin_time:.2f}ms")
     print(f"Speedup: {ref_time/marlin_time:.2f}x")
     
     # 6. Verify results
