@@ -43,6 +43,7 @@ def _get_perms():
     scale_perm_single = []
     for i in range(4):
         scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    print (scale_perm)
     return perm, scale_perm, scale_perm_single
 
 _perm, _scale_perm, _scale_perm_single = _get_perms()
@@ -82,7 +83,7 @@ class QuantUtils():
         k, n = weight.shape
 
         scale = scale.reshape(1, -1)
-        if groupsize != k:
+        if groupsize != -1:
             # weight = weight.reshape((groupsize, -1, n))
             # weight = weight.permute(1, 0, 2)
             # weight = weight.reshape((k, n)).contiguous()

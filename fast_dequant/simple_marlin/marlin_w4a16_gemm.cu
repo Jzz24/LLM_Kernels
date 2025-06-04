@@ -18,7 +18,7 @@ struct Vec {
 
 using I4 = Vec<int, 4>;
 using FragA = Vec<half2, 4>;  // 16x16 A矩阵片段
-using FragB = Vec<half2, 2>;  // 8x16 B矩阵片段  
+using FragB = Vec<half2, 2>;  // 16x8 B矩阵片段  
 using FragC = Vec<float, 4>;  // 16x8 累加器片段
 using FragS = Vec<half2, 1>;  // 量化缩放因子
 
@@ -113,7 +113,7 @@ __global__ void SimpleMarlin(
   FragA frag_a[THREAD_M_BLOCKS]; // 4个Vec<half2, 4>
   I4 frag_b_quant; // Vec<int, 4>;
   FragC frag_c[THREAD_M_BLOCKS][4][2];  // 最后一维是2，对应两次MMA, Vec<float, 4>
-  FragS frag_s[4]; // 4个Vec<half2, 1>;
+  FragS frag_s[4]; // 4个Vec<half2, 1>; 4对应 sub_tile数量, half2对应每个sub_tile的2个mma
 
   // 初始化累加器
   #pragma unroll
@@ -150,6 +150,11 @@ __global__ void SimpleMarlin(
       
       int b_idx = (k_offset + b_row) * (prob_n / 32) + (block_n / 32) + b_col;
       sh_b[threadIdx.x] = B[b_idx];
+
+      // debug
+      // if (k_offset == 0) {
+      //   printf("B[%d] = %d, %d, %d, %d\n", b_idx, B[b_idx].x, B[b_idx].y, B[b_idx].z, B[b_idx].w);
+      // }
     }
 
     if (groupsize != -1 && threadIdx.x < 8) {  // 只需要8个线程！
@@ -185,17 +190,33 @@ __global__ void SimpleMarlin(
       }
       
       // 加载缩放因子 - 基于warp的N位置
+      // if (groupsize != -1) {
+      //   #pragma unroll
+      //   for (int j = 0; j < 4; j++) { 
+      //     int s_sh_offset = (warp_n / 16 + j) * 2 + (lane_id / 16);
+      //     if (s_sh_offset < 8) {
+      //       frag_s[j] = *reinterpret_cast<FragS*>(&sh_s[s_sh_offset]);
+      //     }
+      //   }
+      // }
       if (groupsize != -1) {
-        #pragma unroll
-        for (int j = 0; j < 4; j++) { 
-          int s_sh_offset = (warp_n / 16 + j) * 2 + (lane_id / 16);
-          if (s_sh_offset < 8) {
-            frag_s[j] = *reinterpret_cast<FragS*>(&sh_s[s_sh_offset]);
+        // 每4个线程读取同一个int4
+        int s_sh_offset = lane_id / 4;  
+        
+        if (s_sh_offset < 8) {
+          // 直接使用half2指针读取
+          half2* scales_ptr = reinterpret_cast<half2*>(&sh_s[s_sh_offset]);
+          
+          // 为每个sub_tile分配对应的缩放因子
+          #pragma unroll
+          for (int j = 0; j < 4; j++) {
+            frag_s[j][0] = scales_ptr[j];  // 直接赋值half2
           }
         }
       }
       
       // 简化的B矩阵处理
+      // 四个warp全部加载？
       frag_b_quant = *reinterpret_cast<I4*>(&sh_b[lane_id]);
 
       #pragma unroll
@@ -211,6 +232,21 @@ __global__ void SimpleMarlin(
         if (groupsize != -1) {
           scale(frag_b0, frag_s[sub_tile], 0);
           scale(frag_b1, frag_s[sub_tile], 1);
+        }
+
+        if (4<=blockIdx.x <= 7 && warp_id == 0 && 4<=lane_id <= 7 && sub_tile == 0 && k_offset == 0) {
+          // printf("warp_id: %d, b_quant: %d, b_quant_shift: %d\n, blockidx.x: %d", warp_id, b_quant, b_quant_shift, blockIdx.x);
+          // printf("=== SUB_TILE 0, THREAD 0 DEBUG ===\n");
+          // printf("b_quant = 0x%08x, b_quant_shift = 0x%08x\n", b_quant, b_quant_shift);
+          printf("thread %d, FRAG_B0: [%.3f, %.3f, %.3f, %.3f], frag_s: [%.3f, %.3f]\n",
+            lane_id,
+           __half2float(frag_b0[0].x), __half2float(frag_b0[0].y),
+           __half2float(frag_b0[1].x), __half2float(frag_b0[1].y),
+           __half2float(frag_s[sub_tile][0].x), __half2float(frag_s[sub_tile][0].y)); // 2次mma
+    
+          // printf("FRAG_B1: [%.3f, %.3f, %.3f, %.3f]\n",
+          //  __half2float(frag_b1[0].x), __half2float(frag_b1[0].y),
+          //  __half2float(frag_b1[1].x), __half2float(frag_b1[1].y));
         }
         
         // MMA计算 - 使用正确的索引
