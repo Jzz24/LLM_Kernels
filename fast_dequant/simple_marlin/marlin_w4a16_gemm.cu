@@ -145,16 +145,32 @@ __global__ void SimpleMarlin(
 
     // 32个线程处理16*64的4bits矩阵分块
     if (threadIdx.x < 32) {
-      int b_row = threadIdx.x / 2;      // 0-15行
-      int b_col = threadIdx.x % 2;      // 0-1列（int4列）
+      // int b_row = threadIdx.x / 2;      // 0-15行
+      // int b_col = threadIdx.x % 2;      // 0-1列（int4列）
       
-      int b_idx = (k_offset + b_row) * (prob_n / 32) + (block_n / 32) + b_col;
-      sh_b[threadIdx.x] = B[b_idx];
+      // int b_idx = (k_offset + b_row) * (prob_n / 32) + (block_n / 32) + b_col;
+      // sh_b[threadIdx.x] = B[b_idx];
 
-      // debug
+      // // debug
+      // // 对于blockIdx.x == 1的情况, 16*64的4bit分块，包装成int4 128bit, 也就是1*32个int4 128bits
       // if (k_offset == 0) {
       //   printf("B[%d] = %d, %d, %d, %d\n", b_idx, B[b_idx].x, B[b_idx].y, B[b_idx].z, B[b_idx].w);
       // }
+
+
+      // 新的基于数据块（chunk-based）的B矩阵索引计算
+      
+      int k_strip_idx = k_offset / 16;                     // 当前是第几个K条带 (每个条带16行)
+      int n_tile_idx = blockIdx.x;                         // 当前块处理这个K条带内的第几个N瓦片 (每个瓦片64列)
+      int num_n_tiles_per_k_strip = prob_n / 64;           // 每个K条带总共有多少个N瓦片
+
+      // 计算当前16x64瓦片（即32个int4）在全局B数组中的起始偏移
+      int chunk_base_offset_in_B = (k_strip_idx * num_n_tiles_per_k_strip + n_tile_idx) * 32;
+
+      // 每个线程 (threadIdx.x 从 0 到 31) 加载这个数据块中的一个int4
+      int b_idx = chunk_base_offset_in_B + threadIdx.x;
+      
+      sh_b[threadIdx.x] = B[b_idx]; // 从全局内存B加载到共享内存sh_b
     }
 
     if (groupsize != -1 && threadIdx.x < 8) {  // 只需要8个线程！
@@ -234,12 +250,12 @@ __global__ void SimpleMarlin(
           scale(frag_b1, frag_s[sub_tile], 1);
         }
 
-        if (4<=blockIdx.x <= 7 && warp_id == 0 && 4<=lane_id <= 7 && sub_tile == 0 && k_offset == 0) {
+        if (blockIdx.x == 1 && warp_id == 0 && 4<=lane_id <= 7 && sub_tile == 0 && k_offset == 0) {
           // printf("warp_id: %d, b_quant: %d, b_quant_shift: %d\n, blockidx.x: %d", warp_id, b_quant, b_quant_shift, blockIdx.x);
           // printf("=== SUB_TILE 0, THREAD 0 DEBUG ===\n");
           // printf("b_quant = 0x%08x, b_quant_shift = 0x%08x\n", b_quant, b_quant_shift);
-          printf("thread %d, FRAG_B0: [%.3f, %.3f, %.3f, %.3f], frag_s: [%.3f, %.3f]\n",
-            lane_id,
+          printf("blockidx.x %d, thread %d, FRAG_B0: [%.3f, %.3f, %.3f, %.3f], frag_s: [%.3f, %.3f]\n",
+            blockIdx.x, lane_id,
            __half2float(frag_b0[0].x), __half2float(frag_b0[0].y),
            __half2float(frag_b0[1].x), __half2float(frag_b0[1].y),
            __half2float(frag_s[sub_tile][0].x), __half2float(frag_s[sub_tile][0].y)); // 2次mma

@@ -56,7 +56,7 @@ def test_marlin_w4a16_gemm():
     
     # Test parameters
     # M, N, K = 256, 512, 1024
-    M, N, K = 64, 64*2, 128
+    M, N, K = 64*2, 64*8, 128*8
     groupsize = 128
     
     print(f"Matrix size: M={M}, N={N}, K={K}, groupsize={groupsize}")
@@ -70,9 +70,9 @@ def test_marlin_w4a16_gemm():
     
     # 3. Pack weights to Marlin format
     packed_weight, packed_scales = QuantUtils.pack(W_int4, scales, groupsize=groupsize)
-    print ("k_offset=0, 16*64 packed weight, thread 0", packed_weight[0])
-    print ("k_offset=0, 16*16 ref_dequant,\n", ref_dequant[:16,1])
-    print ("k_offset=0, 16*16 scales,\n", scales[:,:16])
+    print ("k_offset=0, 16*64 packed weight, thread 0", packed_weight[0][128:]) # 1 for 0-15行，64-128列
+    print ("k_offset=0, 16*16 ref_dequant,\n", ref_dequant[:16,64:80])
+    print ("k_offset=0, 16*16 scales,\n", scales[:,64:80])
     # print ("k_offset=0, 16*16 packed scales,\n", packed_scales[:,:16])
 
     import ipdb; ipdb.set_trace()
@@ -104,9 +104,6 @@ def test_marlin_w4a16_gemm():
     print(f"Speedup: {ref_time/marlin_time:.2f}x")
     
     # 6. Verify results
-    print (C_marlin, "\n", C_ref)
-    print (C_marlin.max(), C_marlin.min())
-
     is_correct = check_results(C_marlin, C_ref, threshold=0.001)
     
     if is_correct:
