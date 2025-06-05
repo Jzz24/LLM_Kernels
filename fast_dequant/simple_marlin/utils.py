@@ -43,7 +43,6 @@ def _get_perms():
     scale_perm_single = []
     for i in range(4):
         scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    print (scale_perm)
     return perm, scale_perm, scale_perm_single
 
 _perm, _scale_perm, _scale_perm_single = _get_perms()
@@ -65,19 +64,6 @@ class QuantUtils():
 
         assert weight.dtype == torch.int, f"weight dtype {weight.dtype} != torch.int"
         assert weight.shape[0] % groupsize == 0, "Weight shape must be divisible by groupsize"
-
-        # tile = 16
-        # maxq = 2 ** 4 - 1
-        # k, n = weight.shape
-        # if groupsize != k:
-        #     weight = weight.reshape((-1, groupsize, n))
-        #     weight = weight.permute(1, 0, 2)
-        #     weight = weight.reshape((groupsize, -1))
-        #     scale = scale.reshape((1, -1))
-
-        # weight = torch.round(weight / scale).int()
-        # weight += (maxq + 1) // 2  # shift to uint4 for fast uint4 to fp16 conversion
-        # weight = torch.clamp(weight, 0, maxq)
 
         tile = 16
         k, n = weight.shape
