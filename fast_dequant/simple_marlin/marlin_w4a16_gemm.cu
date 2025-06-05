@@ -321,7 +321,6 @@ int simple_marlin_cuda(
             reinterpret_cast<const int4*>(s),
             prob_m, prob_n, prob_k, groupsize
         );
-    
-    printf("CUDA kernel completed successfully!\n");
+        
     return 0;
 }
