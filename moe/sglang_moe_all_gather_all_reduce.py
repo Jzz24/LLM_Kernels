@@ -299,13 +299,16 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+
+        # print(f"Rank {self.tp_rank}: gateup_input.device = {gateup_input.device}")
+        # print(f"Rank {self.tp_rank}: gateup_input memory address = {gateup_input.data_ptr()}")
         
         # 按照expert顺序重排每个rank的tokens
         # 输入fp16 hidden_states, 输出量化的gateup_input
-        # 申请[num_tokens * topk, hidden_size]形状的gateup_input
+        # 每个rank申请[num_tokens * topk, hidden_size]形状的gateup_input
         # 在当前非all_to_all的通信模式下
-        # 重排后的gateup_input,每个rank只处理 约1/num_rank 的tokens
-        # 因此大约有(num_rank-1)/num_rank的空间被浪费
+        # 重排后的gateup_input,每个rank仅初始化 约1/num_rank 的tokens
+        # 因此大约有(num_rank-1)/num_rank的空间未初始化被浪费
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
             gateup_input,
